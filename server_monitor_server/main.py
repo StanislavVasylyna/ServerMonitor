@@ -46,12 +46,14 @@ def get_memory_usage():
 
 def get_disk_usage(path="/"):
     usage = shutil.disk_usage(path)
+    usable_bytes = usage.used + usage.free
+    usage_percent = usage.used / usable_bytes * 100 if usable_bytes else 0.0
     return {
         "path": path,
         "total_bytes": usage.total,
         "used_bytes": usage.used,
         "free_bytes": usage.free,
-        "usage_percent": round(usage.used / usage.total * 100, 2),
+        "usage_percent": round(usage_percent, 2),
     }
 
 

@@ -5,6 +5,7 @@
 #include <SPI.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <math.h>
 
 #include "config.h"
 
@@ -25,6 +26,20 @@ struct ServerStats {
 ServerStats stats;
 unsigned long lastPollMillis = 0;
 String lastError;
+
+enum class DisplayMode {
+  NONE,
+  MESSAGE,
+  STATS,
+};
+
+DisplayMode displayMode = DisplayMode::NONE;
+int16_t displayedCpuTenths = -1;
+int16_t displayedMemoryTenths = -1;
+int16_t displayedDiskTenths = -1;
+String displayedMessage;
+String displayedError;
+String displayedIp;
 
 uint16_t colorForPercent(float percent) {
   if (percent >= 85.0F) {
@@ -60,7 +75,25 @@ void drawCenteredText(const String &text, int16_t y, uint16_t color,
   tft.print(text);
 }
 
-void drawProgressBar(int16_t y, const char *label, float rawPercent) {
+int16_t percentTenths(float rawPercent) {
+  return static_cast<int16_t>(roundf(clampPercent(rawPercent) * 10.0F));
+}
+
+void drawProgressBarFrame(int16_t y, const char *label) {
+  const int16_t margin = 7;
+  const int16_t barWidth = tft.width() - margin * 2;
+  const int16_t barHeight = tft.height() <= 128 ? 12 : 14;
+
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+  tft.setCursor(margin, y);
+  tft.print(label);
+
+  const int16_t barY = y + 10;
+  tft.drawRoundRect(margin, barY, barWidth, barHeight, 3, ST77XX_WHITE);
+}
+
+void updateProgressBar(int16_t y, float rawPercent) {
   const float percent = clampPercent(rawPercent);
   const int16_t margin = 7;
   const int16_t barWidth = tft.width() - margin * 2;
@@ -68,22 +101,20 @@ void drawProgressBar(int16_t y, const char *label, float rawPercent) {
   const int16_t fillWidth =
       static_cast<int16_t>((barWidth - 4) * percent / 100.0F);
 
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-  tft.setCursor(margin, y);
-  tft.print(label);
-
   String value = String(percent, 1) + "%";
   int16_t x1;
   int16_t y1;
   uint16_t textWidth;
   uint16_t textHeight;
   tft.getTextBounds(value, 0, y, &x1, &y1, &textWidth, &textHeight);
+  tft.fillRect(tft.width() / 2, y, tft.width() / 2 - margin, textHeight,
+               ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
   tft.setCursor(tft.width() - margin - textWidth, y);
   tft.print(value);
 
   const int16_t barY = y + 10;
-  tft.drawRoundRect(margin, barY, barWidth, barHeight, 3, ST77XX_WHITE);
   tft.fillRoundRect(margin + 2, barY + 2, barWidth - 4, barHeight - 4, 2,
                     ST77XX_BLACK);
   if (fillWidth > 0) {
@@ -92,32 +123,96 @@ void drawProgressBar(int16_t y, const char *label, float rawPercent) {
   }
 }
 
-void drawStatusScreen() {
+void drawScreenFrame() {
   tft.fillScreen(ST77XX_BLACK);
   drawCenteredText("SERVER MONITOR", 5, ST77XX_CYAN, 1);
   tft.drawFastHLine(5, 16, tft.width() - 10, ST77XX_BLUE);
+}
+
+void clearScreenContent() {
+  tft.fillRect(0, 17, tft.width(), tft.height() - 17, ST77XX_BLACK);
+}
+
+void resetDisplayedStats() {
+  displayedCpuTenths = -1;
+  displayedMemoryTenths = -1;
+  displayedDiskTenths = -1;
+}
+
+void drawMessageScreen(const String &message, const String &error) {
+  if (displayMode == DisplayMode::MESSAGE && displayedMessage == message &&
+      displayedError == error) {
+    return;
+  }
+
+  clearScreenContent();
+  drawCenteredText(message, tft.height() / 2 - 12, ST77XX_YELLOW, 1);
+  if (error.length() > 0) {
+    drawCenteredText(error.substring(0, 20), tft.height() / 2 + 5, ST77XX_RED,
+                     1);
+  }
+
+  displayMode = DisplayMode::MESSAGE;
+  displayedMessage = message;
+  displayedError = error;
+  displayedIp = "";
+}
+
+void updateIpAddress() {
+  const String ip =
+      WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "";
+  if (displayedIp == ip) {
+    return;
+  }
+
+  tft.fillRect(5, tft.height() - 9, tft.width() - 10, 8, ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_DARK_GREY, ST77XX_BLACK);
+  tft.setCursor(5, tft.height() - 9);
+  tft.print(ip);
+  displayedIp = ip;
+}
+
+void updateStatusScreen() {
+  const String message =
+      WiFi.status() == WL_CONNECTED ? "NO SERVER DATA" : "CONNECTING WIFI";
 
   if (!stats.valid) {
-    drawCenteredText(WiFi.status() == WL_CONNECTED ? "NO SERVER DATA"
-                                                   : "CONNECTING WIFI",
-                     tft.height() / 2 - 12, ST77XX_YELLOW, 1);
-    if (lastError.length() > 0) {
-      drawCenteredText(lastError.substring(0, 20), tft.height() / 2 + 5,
-                       ST77XX_RED, 1);
-    }
+    drawMessageScreen(message, lastError);
     return;
   }
 
   const int16_t firstY = tft.height() <= 128 ? 24 : 28;
   const int16_t spacing = tft.height() <= 128 ? 29 : 34;
-  drawProgressBar(firstY, "CPU", stats.cpu);
-  drawProgressBar(firstY + spacing, "RAM", stats.memory);
-  drawProgressBar(firstY + spacing * 2, "DISK", stats.disk);
+  if (displayMode != DisplayMode::STATS) {
+    clearScreenContent();
+    drawProgressBarFrame(firstY, "CPU");
+    drawProgressBarFrame(firstY + spacing, "RAM");
+    drawProgressBarFrame(firstY + spacing * 2, "DISK");
+    resetDisplayedStats();
+    displayedIp = "";
+    displayMode = DisplayMode::STATS;
+  }
 
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_DARK_GREY, ST77XX_BLACK);
-  tft.setCursor(5, tft.height() - 9);
-  tft.print(WiFi.localIP());
+  const int16_t cpuTenths = percentTenths(stats.cpu);
+  if (displayedCpuTenths != cpuTenths) {
+    updateProgressBar(firstY, cpuTenths / 10.0F);
+    displayedCpuTenths = cpuTenths;
+  }
+
+  const int16_t memoryTenths = percentTenths(stats.memory);
+  if (displayedMemoryTenths != memoryTenths) {
+    updateProgressBar(firstY + spacing, memoryTenths / 10.0F);
+    displayedMemoryTenths = memoryTenths;
+  }
+
+  const int16_t diskTenths = percentTenths(stats.disk);
+  if (displayedDiskTenths != diskTenths) {
+    updateProgressBar(firstY + spacing * 2, diskTenths / 10.0F);
+    displayedDiskTenths = diskTenths;
+  }
+
+  updateIpAddress();
 }
 
 bool fetchServerStats() {
@@ -250,7 +345,8 @@ void initializeDisplay() {
 #endif
   tft.setRotation(TFT_ROTATION);
   tft.setTextWrap(false);
-  drawStatusScreen();
+  drawScreenFrame();
+  updateStatusScreen();
 }
 
 void setup() {
@@ -260,7 +356,7 @@ void setup() {
   configureWebServer();
 
   fetchServerStats();
-  drawStatusScreen();
+  updateStatusScreen();
   lastPollMillis = millis();
 
   Serial.print("ESP32 dashboard: http://");
@@ -273,7 +369,7 @@ void loop() {
   if (millis() - lastPollMillis >= POLL_INTERVAL_MS) {
     lastPollMillis = millis();
     fetchServerStats();
-    drawStatusScreen();
+    updateStatusScreen();
   }
 
   delay(2);
