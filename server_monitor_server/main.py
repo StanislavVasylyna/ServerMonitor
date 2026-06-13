@@ -1,8 +1,12 @@
 import json
 import os
 import shutil
+import signal
+import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import psutil
 
 
 def read_cpu_times():
@@ -44,16 +48,89 @@ def get_memory_usage():
     }
 
 
-def get_disk_usage(path="/"):
-    usage = shutil.disk_usage(path)
-    usable_bytes = usage.used + usage.free
-    usage_percent = usage.used / usable_bytes * 100 if usable_bytes else 0.0
+def get_disk_usage(alert_threshold=90):
+    ignored_fstypes = {
+        "tmpfs",
+        "devtmpfs",
+        "squashfs",
+        "overlay",
+        "aufs",
+        "proc",
+        "sysfs",
+        "cgroup",
+        "cgroup2",
+        "debugfs",
+        "tracefs",
+        "securityfs",
+        "fusectl",
+        "configfs",
+    }
+
+    total_bytes = 0
+    used_bytes = 0
+    free_bytes = 0
+
+    partitions = []
+    alerts = []
+
+    seen_mounts = set()
+
+    for part in psutil.disk_partitions(all=False):
+        if part.mountpoint in seen_mounts:
+            continue
+
+        seen_mounts.add(part.mountpoint)
+
+        if not part.device.startswith("/dev/"):
+            continue
+
+        if part.fstype in ignored_fstypes:
+            continue
+
+        try:
+            usage = shutil.disk_usage(part.mountpoint)
+        except (PermissionError, FileNotFoundError, OSError):
+            continue
+
+        usable_bytes = usage.used + usage.free
+        usage_percent = usage.used / usable_bytes * 100 if usable_bytes else 0.0
+
+        item = {
+            "device": part.device,
+            "mountpoint": part.mountpoint,
+            "fstype": part.fstype,
+            "total_bytes": usage.total,
+            "used_bytes": usage.used,
+            "free_bytes": usage.free,
+            "usage_percent": round(usage_percent, 2),
+        }
+
+        partitions.append(item)
+
+        total_bytes += usage.total
+        used_bytes += usage.used
+        free_bytes += usage.free
+
+        if usage_percent >= alert_threshold:
+            alerts.append({
+                "type": "disk_space_low",
+                "level": "warning" if usage_percent < 95 else "critical",
+                "device": part.device,
+                "mountpoint": part.mountpoint,
+                "usage_percent": round(usage_percent, 2),
+                "free_bytes": usage.free,
+            })
+
+    usable_total = used_bytes + free_bytes
+    total_usage_percent = used_bytes / usable_total * 100 if usable_total else 0.0
+
     return {
-        "path": path,
-        "total_bytes": usage.total,
-        "used_bytes": usage.used,
-        "free_bytes": usage.free,
-        "usage_percent": round(usage_percent, 2),
+        "total_bytes": total_bytes,
+        "used_bytes": used_bytes,
+        "free_bytes": free_bytes,
+        "usage_percent": round(total_usage_percent, 2),
+        "partitions": partitions,
+        "alerts": alerts,
     }
 
 
@@ -96,16 +173,26 @@ class StatsHandler(BaseHTTPRequestHandler):
         print(f"{self.address_string()} - {message_format % args}")
 
 
+
 def main():
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
     server = ThreadingHTTPServer((host, port), StatsHandler)
     print(f"Server statistics API is available at http://{host}:{port}/stats")
 
+    def shutdown_handler(signum, frame):
+        print("Stopping server...")
+        server.shutdown()
+        server.server_close()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown_handler)  # Ctrl+C
+    signal.signal(signal.SIGTERM, shutdown_handler)  # docker stop
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        shutdown_handler(None, None)
     finally:
         server.server_close()
 
